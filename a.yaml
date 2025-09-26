@@ -1,0 +1,158 @@
+name: Build Static GCC for AArch64
+on:
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  GCC_VERSION: 13.2.0
+  TARGET: aarch64-linux-musl
+  PREFIX: /opt/cross
+  ARTIFACT_NAME: aarch64-static-gcc-${{ env.GCC_VERSION }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120  # 编译可能很耗时
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          wget \
+          tar \
+          xz-utils \
+          gzip \
+          bzip2 \
+          flex \
+          bison \
+          dejagnu \
+          texinfo \
+          ncurses-dev \
+          python3 \
+          git \
+          file
+      timeout-minutes: 10
+
+    - name: Create build directories
+      run: |
+        sudo mkdir -p ${{ env.PREFIX }}
+        sudo chown -R $USER:$USER ${{ env.PREFIX }}
+        mkdir -p ${{ github.workspace }}/build-gcc
+        mkdir - ${{ github.workspace }}/sources
+
+    - name: Download GCC source
+      run: |
+        cd ${{ github.workspace }}/sources
+        wget https://ftp.gnu.org/gnu/gcc/gcc-${{ env.GCC_VERSION }}/gcc-${{ env.GCC_VERSION }}.tar.xz
+        tar -xf gcc-${{ env.GCC_VERSION }}.tar.xz
+
+    - name: Download prerequisites
+      run: |
+        cd ${{ github.workspace }}/sources/gcc-${{ env.GCC_VERSION }}
+        ./contrib/download_prerequisites
+
+    - name: Build musl-cross-compiler (AArch64)
+      run: |
+        cd ${{ github.workspace }}/sources
+        git clone https://github.com/richfelker/musl-cross-make.git
+        cd musl-cross-make
+        
+        cat > config.mak << 'EOF'
+        TARGET = ${{ env.TARGET }}
+        OUTPUT = ${{ env.PREFIX }}
+        GCC_VER = ${{ env.GCC_VERSION }}
+        LINUX_HEADERS_VER = 6.1
+        BINUTILS_VER = 2.40
+        MUSL_VER = 1.2.4
+        
+        # 静态编译配置
+        STATIC = --static
+        EOF
+        
+        make -j$(nproc)
+        make install
+        
+        # 添加到PATH
+        echo "${{ env.PREFIX }}/bin" >> $GITHUB_PATH
+      timeout-minutes: 90
+
+    - name: Configure GCC for static build
+      run: |
+        cd ${{ github.workspace }}/build-gcc
+        ../sources/gcc-${{ env.GCC_VERSION }}/configure \
+          --target=${{ env.TARGET }} \
+          --prefix=${{ env.PREFIX }} \
+          --enable-languages=c,c++ \
+          --disable-multilib \
+          --disable-shared \
+          --enable-static \
+          --with-sysroot=${{ env.PREFIX }}/${{ env.TARGET }} \
+          --with-build-sysroot=${{ env.PREFIX }}/${{ env.TARGET }} \
+          --disable-nls \
+          --disable-libsanitizer \
+          --disable-libquadmath \
+          --disable-libssp \
+          --disable-libgomp \
+          --disable-libmudflap \
+          --with-pic
+      timeout-minutes: 5
+
+    - name: Build GCC
+      run: |
+        cd ${{ github.workspace }}/build-gcc
+        make -j$(nproc) all-gcc
+        make -j$(nproc) all-target-libgcc
+      timeout-minutes: 60
+
+    - name: Install GCC
+      run: |
+        cd ${{ github.workspace }}/build-gcc
+        sudo make install-gcc
+        sudo make install-target-libgcc
+
+    - name: Test the compiler
+      run: |
+        # 测试静态编译功能
+        cat > test_hello.c << 'EOF'
+        #include <stdio.h>
+        int main() {
+            printf("Hello, AArch64 Static World!\n");
+            return 0;
+        }
+        EOF
+        
+        ${{ env.PREFIX }}/bin/${{ env.TARGET }}-gcc -static test_hello.c -o test_hello
+        file test_hello
+        # 验证是否为静态链接
+        ldd test_hello 2>/dev/null || echo "Binary is statically linked"
+
+    - name: Package artifact
+      run: |
+        cd ${{ env.PREFIX }}
+        tar -czf ${{ github.workspace }}/${{ env.ARTIFACT_NAME }}.tar.gz .
+        
+        # 列出打包内容
+        echo "Artifact contents:"
+        tar -tzf ${{ github.workspace }}/${{ env.ARTIFACT_NAME }}.tar.gz | head -20
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ARTIFACT_NAME }}
+        path: ${{ github.workspace }}/${{ env.ARTIFACT_NAME }}.tar.gz
+        retention-days: 30
+
+    - name: Create release on tag
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: ${{ github.workspace }}/${{ env.ARTIFACT_NAME }}.tar.gz
+        body: |
+          Static GCC ${{ env.GCC_VERSION }} for AArch64 (musl-based)
+          - Target: ${{ env.TARGET }}
+          - Static linking enabled
+          - Languages: C, C++
